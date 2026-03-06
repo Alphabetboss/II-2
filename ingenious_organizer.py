@@ -1,34 +1,45 @@
 #!/usr/bin/env python3
 """
-Ingenious Irrigation File Organizer
+Ingenious Irrigation Organizer — Hybrid, Pi-Ready
 
-- Creates a standard Ingenious Irrigation folder tree
-- Scans a source directory and moves files into the tree
-- Uses keyword + extension rules
-- Dry-run mode available (recommended first)
-- Avoids overwrites by renaming duplicates
-- Writes a log file of all actions
+Core:
+- Creates standard Ingenious Irrigation folder tree
+- Classifies by keyword + extension
+- EXIF-based date sorting for images (optional)
+- PDF text extraction for smarter routing (optional)
+- Duplicate detection via content hash
+- Dry-run mode
+- Rollback log (moves recorded)
+- JSON + text logs
 
-USAGE EXAMPLES:
-  # Dry run (preview actions) sorting your Downloads into ~/Ingenious_Irrigation
-  python3 ingenious_organizer.py --source ~/Downloads --dest ~/Ingenious_Irrigation --dry-run
+Online Boosters (optional, non-blocking):
+- Cloud AI classification hook (stubbed; you wire your API later)
+- OneDrive sync via rclone remote "onedrive:"
 
-  # Real run
-  python3 ingenious_organizer.py --source ~/Downloads --dest ~/Ingenious_Irrigation
+Runtime target:
+- Raspberry Pi 5 (Linux)
 
-  # Sort multiple sources (repeat --source)
-  python3 ingenious_organizer.py --source ~/Downloads --source ~/Desktop --dest ~/Ingenious_Irrigation --dry-run
+Requires (install on Pi):
+  sudo apt update
+  sudo apt install -y python3-pip exiftool rclone
+  pip3 install pillow PyPDF2
 """
 
 from __future__ import annotations
 import argparse
+import hashlib
+import json
 import os
 import re
 import shutil
-from dataclasses import dataclass
+import subprocess
+from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Tuple
+
+from PIL import Image, ExifTags
+from PyPDF2 import PdfReader
 
 # -----------------------------
 # 1) Folder tree definition
@@ -95,8 +106,6 @@ FOLDER_TREE = [
 # -----------------------------
 # 2) Classification rules
 # -----------------------------
-
-# Extension -> folder mapping (fallback / baseline)
 EXTENSION_RULES = {
     # Docs
     ".pdf": "99_Inbox_Sort_Later",
@@ -134,8 +143,6 @@ EXTENSION_RULES = {
     ".rar": "09_IT/01_Backups",
 }
 
-# Keyword rules (higher priority than extension rules)
-# If filename contains a keyword pattern, it routes to a specific folder.
 KEYWORD_RULES: List[Tuple[re.Pattern, str]] = [
     (re.compile(r"\b(invoice|inv)\b", re.I), "01_Finance/02_Invoices_Out"),
     (re.compile(r"\b(receipt|paid|payment)\b", re.I), "01_Finance/03_Receipts"),
@@ -163,32 +170,32 @@ KEYWORD_RULES: List[Tuple[re.Pattern, str]] = [
     (re.compile(r"\b(license\s*key|serial|activation)\b", re.I), "09_IT/02_Software_Licenses"),
 ]
 
-# Things we usually should NOT move (system / app stuff)
 SKIP_DIR_NAMES = {".git", "__pycache__", "node_modules", ".DS_Store"}
 SKIP_EXTENSIONS = {".tmp", ".part", ".crdownload", ".download"}
 
+# -----------------------------
+# 3) Data structures
+# -----------------------------
 @dataclass
 class PlanItem:
     src: Path
     dest: Path
     reason: str
+    hash: Optional[str] = None  # for duplicate detection
 
+# -----------------------------
+# 4) Helpers
+# -----------------------------
 def ensure_tree(dest_root: Path) -> None:
     for rel in FOLDER_TREE:
         (dest_root / rel).mkdir(parents=True, exist_ok=True)
 
 def safe_destination(dest_path: Path) -> Path:
-    """
-    If dest already exists, auto-rename:
-      file.pdf -> file (1).pdf, file (2).pdf, etc.
-    """
     if not dest_path.exists():
         return dest_path
-
     stem = dest_path.stem
     suffix = dest_path.suffix
     parent = dest_path.parent
-
     i = 1
     while True:
         candidate = parent / f"{stem} ({i}){suffix}"
@@ -196,37 +203,131 @@ def safe_destination(dest_path: Path) -> Path:
             return candidate
         i += 1
 
+def file_hash(path: Path, chunk_size: int = 65536) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+def extract_exif_date(path: Path) -> Optional[str]:
+    try:
+        img = Image.open(path)
+        exif = img._getexif()
+        if not exif:
+            return None
+        tag_map = {ExifTags.TAGS.get(k, k): v for k, v in exif.items()}
+        date_str = tag_map.get("DateTimeOriginal") or tag_map.get("DateTime")
+        if not date_str:
+            return None
+        # Format: "YYYY:MM:DD HH:MM:SS"
+        parts = date_str.split(" ")[0].split(":")
+        if len(parts) >= 3:
+            y, m, d = parts[:3]
+            return f"{y}-{m}-{d}"
+    except Exception:
+        return None
+    return None
+
+def extract_pdf_text_snippet(path: Path, max_chars: int = 2000) -> str:
+    try:
+        reader = PdfReader(str(path))
+        text = ""
+        for page in reader.pages:
+            text += page.extract_text() or ""
+            if len(text) >= max_chars:
+                break
+        return text[:max_chars]
+    except Exception:
+        return ""
+
+def ai_classify_stub(filename: str, text_snippet: str) -> Optional[str]:
+    """
+    Hybrid hook: this is where you'd call a cloud LLM if online.
+    For now, it's a stub that returns None (no override).
+    Later you can:
+      - Check connectivity
+      - Call your API
+      - Map response to folder
+    """
+    # Example pseudo-logic:
+    # if not online(): return None
+    # response = call_llm_api(filename, text_snippet)
+    # return map_response_to_folder(response)
+    return None
+
 def classify(file_path: Path) -> Tuple[str, str]:
     """
     Returns: (relative_folder, reason)
+    Hybrid logic:
+      1) Keyword rules
+      2) Extension rules
+      3) EXIF / PDF hints
+      4) AI stub (optional)
+      5) Default inbox
     """
     name = file_path.name
 
-    # Keyword rules first (highest confidence)
+    # 1) Keyword rules
     for pattern, target in KEYWORD_RULES:
         if pattern.search(name):
             return target, f"keyword:{pattern.pattern}"
 
-    # Extension rules next
+    # 2) Extension rules
     ext = file_path.suffix.lower()
     if ext in EXTENSION_RULES:
-        return EXTENSION_RULES[ext], f"extension:{ext}"
+        base_folder = EXTENSION_RULES[ext]
+    else:
+        base_folder = "99_Inbox_Sort_Later"
 
-    # Default
-    return "99_Inbox_Sort_Later", "default"
+    reason_parts = []
+
+    # 3) EXIF for images
+    if ext in {".jpg", ".jpeg", ".png", ".heic"}:
+        date_str = extract_exif_date(file_path)
+        if date_str:
+            # Example: route by year under Photos
+            year = date_str.split("-")[0]
+            base_folder = f"06_Field_Documentation/01_Photos/{year}"
+            reason_parts.append(f"exif:{date_str}")
+
+    # 3b) PDF text snippet (for future AI / smarter rules)
+    text_snippet = ""
+    if ext == ".pdf":
+        text_snippet = extract_pdf_text_snippet(file_path)
+        # You could add extra regex rules on text_snippet here if you want.
+
+    # 4) AI stub (optional override)
+    ai_folder = ai_classify_stub(name, text_snippet)
+    if ai_folder:
+        return ai_folder, "ai:cloud"
+
+    # 5) Fallback
+    if not reason_parts:
+        reason_parts.append(f"extension:{ext}" if ext in EXTENSION_RULES else "default")
+
+    return base_folder, "+".join(reason_parts)
 
 def should_skip(path: Path) -> bool:
     if path.is_dir():
         return path.name in SKIP_DIR_NAMES
-    # files
     if path.name in SKIP_DIR_NAMES:
         return True
     if path.suffix.lower() in SKIP_EXTENSIONS:
         return True
     return False
 
-def build_plan(sources: List[Path], dest_root: Path, recursive: bool) -> List[PlanItem]:
+def build_plan(
+    sources: List[Path],
+    dest_root: Path,
+    recursive: bool,
+    enable_hashes: bool = True,
+) -> List[PlanItem]:
     plan: List[PlanItem] = []
+    seen_hashes: dict[str, Path] = {}
 
     for src_root in sources:
         if not src_root.exists():
@@ -237,31 +338,56 @@ def build_plan(sources: List[Path], dest_root: Path, recursive: bool) -> List[Pl
             if should_skip(p):
                 continue
             if p.is_dir():
-                continue  # only moving files
+                continue
 
             rel_folder, reason = classify(p)
             dest_dir = dest_root / rel_folder
             dest_dir.mkdir(parents=True, exist_ok=True)
 
+            h = file_hash(p) if enable_hashes else None
+            if h and h in seen_hashes:
+                # Duplicate detected
+                reason = f"{reason}+duplicate_of:{seen_hashes[h]}"
+                # You can choose to skip duplicates instead of moving:
+                # plan.append(PlanItem(src=p, dest=p, reason=reason, hash=h))
+                # continue
+            else:
+                if h:
+                    seen_hashes[h] = p
+
             dest_path = safe_destination(dest_dir / p.name)
-            plan.append(PlanItem(src=p, dest=dest_path, reason=reason))
+            plan.append(PlanItem(src=p, dest=dest_path, reason=reason, hash=h))
 
     return plan
 
-def write_log(dest_root: Path, items: List[PlanItem], dry_run: bool) -> Path:
+def write_logs(dest_root: Path, items: List[PlanItem], dry_run: bool) -> Tuple[Path, Path, Path]:
     logs_dir = dest_root / "09_IT/01_Backups" / "Organizer_Logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
-    log_path = logs_dir / f"organizer_{'DRYRUN_' if dry_run else ''}{stamp}.log"
 
-    with log_path.open("w", encoding="utf-8") as f:
+    text_log = logs_dir / f"organizer_{'DRYRUN_' if dry_run else ''}{stamp}.log"
+    json_log = logs_dir / f"organizer_{'DRYRUN_' if dry_run else ''}{stamp}.json"
+    rollback_log = logs_dir / f"rollback_{'DRYRUN_' if dry_run else ''}{stamp}.json"
+
+    with text_log.open("w", encoding="utf-8") as f:
         f.write(f"Dry run: {dry_run}\n")
         f.write(f"Generated: {datetime.now().isoformat()}\n")
         f.write(f"Total items: {len(items)}\n\n")
         for item in items:
             f.write(f"{item.src}  ->  {item.dest}   [{item.reason}]\n")
 
-    return log_path
+    with json_log.open("w", encoding="utf-8") as f:
+        json.dump([asdict(i) for i in items], f, indent=2, default=str)
+
+    # rollback log: only src/dest
+    with rollback_log.open("w", encoding="utf-8") as f:
+        json.dump(
+            [{"src": str(i.src), "dest": str(i.dest)} for i in items],
+            f,
+            indent=2,
+        )
+
+    return text_log, json_log, rollback_log
 
 def execute_plan(items: List[PlanItem], dry_run: bool) -> None:
     for item in items:
@@ -270,9 +396,64 @@ def execute_plan(items: List[PlanItem], dry_run: bool) -> None:
         item.dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(item.src), str(item.dest))
 
+def cleanup_empty_dirs(root: Path) -> None:
+    for dirpath, dirnames, filenames in os.walk(root, topdown=False):
+        p = Path(dirpath)
+        if p.name in SKIP_DIR_NAMES:
+            continue
+        try:
+            if not any(p.iterdir()):
+                p.rmdir()
+        except OSError:
+            pass
+
+def run_onedrive_sync(local_root: Path, remote_name: str = "onedrive", remote_path: str = "Ingenious_Irrigation") -> None:
+    """
+    Non-blocking OneDrive sync via rclone.
+    Assumes you've configured a remote called 'onedrive'.
+    Example command:
+      rclone sync /path/to/root onedrive:Ingenious_Irrigation
+    If rclone or remote is missing, this should fail silently.
+    """
+    try:
+        cmd = [
+            "rclone",
+            "sync",
+            str(local_root),
+            f"{remote_name}:{remote_path}",
+            "--fast-list",
+        ]
+        subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        # Silent fail; core system must never depend on cloud
+        pass
+
+def rollback_from_log(rollback_log: Path, dry_run: bool = False) -> None:
+    """
+    Rollback moves using a rollback log generated earlier.
+    This assumes dest files still exist.
+    """
+    with rollback_log.open("r", encoding="utf-8") as f:
+        entries = json.load(f)
+
+    for entry in entries:
+        src = Path(entry["src"])
+        dest = Path(entry["dest"])
+        # To rollback, we move dest back to src
+        if not dest.exists():
+            continue
+        if dry_run:
+            print(f"[ROLLBACK DRY] {dest} -> {src}")
+            continue
+        src.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(dest), str(src))
+
+# -----------------------------
+# 5) Main
+# -----------------------------
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Organize files into Ingenious Irrigation folder tree.")
-    parser.add_argument("--source", action="append", required=True,
+    parser = argparse.ArgumentParser(description="Organize files into Ingenious Irrigation folder tree (Hybrid, Pi-ready).")
+    parser.add_argument("--source", action="append", required=False,
                         help="Source directory to scan (repeatable). Example: --source ~/Downloads")
     parser.add_argument("--dest", required=True,
                         help="Destination root. Example: --dest ~/Ingenious_Irrigation")
@@ -280,40 +461,90 @@ def main() -> int:
                         help="Preview what would happen without moving files.")
     parser.add_argument("--non-recursive", action="store_true",
                         help="Only scan the top-level of each source directory (no subfolders).")
+    parser.add_argument("--no-hash", action="store_true",
+                        help="Disable content hashing (faster, but no duplicate detection).")
+    parser.add_argument("--sync-onedrive", action="store_true",
+                        help="Attempt OneDrive sync via rclone after organizing.")
+    parser.add_argument("--rollback", metavar="ROLLBACK_LOG",
+                        help="Rollback moves using a rollback log JSON file.")
+    parser.add_argument("--sources-from-file", metavar="FILE",
+                        help="Optional: file containing one source path per line.")
 
     args = parser.parse_args()
 
-    sources = [Path(os.path.expanduser(s)).resolve() for s in args.source]
     dest_root = Path(os.path.expanduser(args.dest)).resolve()
 
+    # Rollback mode
+    if args.rollback:
+        rollback_log = Path(args.rollback).resolve()
+        print(f"\nRollback mode using log: {rollback_log}")
+        rollback_from_log(rollback_log, dry_run=args.dry_run)
+        print("\nRollback DRY RUN complete." if args.dry_run else "\nRollback complete.")
+        return 0
+
+    # Normal organize mode
+    sources: List[Path] = []
+    if args.source:
+        sources.extend(Path(os.path.expanduser(s)).resolve() for s in args.source)
+
+    if args.sources_from_file:
+        src_file = Path(os.path.expanduser(args.sources_from_file)).resolve()
+        if src_file.exists():
+            with src_file.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    sources.append(Path(os.path.expanduser(line)).resolve())
+
+    if not sources:
+        print("No sources provided. Use --source or --sources-from-file.")
+        return 1
+
     ensure_tree(dest_root)
-    plan = build_plan(sources, dest_root, recursive=not args.non_recursive)
+    plan = build_plan(
+        sources,
+        dest_root,
+        recursive=not args.non_recursive,
+        enable_hashes=not args.no_hash,
+    )
 
-    log_path = write_log(dest_root, plan, dry_run=args.dry_run)
+    text_log, json_log, rollback_log = write_logs(dest_root, plan, dry_run=args.dry_run)
 
-    # Print summary
-    print(f"\nIngenious Irrigation Organizer")
+    # Summary
+    print(f"\nIngenious Irrigation Organizer (Hybrid)")
     print(f"Destination: {dest_root}")
     print(f"Sources: {', '.join(str(s) for s in sources)}")
     print(f"Files planned: {len(plan)}")
-    print(f"Log: {log_path}")
+    print(f"Log: {text_log}")
+    print(f"JSON: {json_log}")
+    print(f"Rollback log: {rollback_log}")
 
-    # Show top 25 planned moves for quick sanity check
     preview = plan[:25]
     if preview:
         print("\nPreview (first 25):")
         for item in preview:
-            print(f"- {item.src.name} -> {item.dest.relative_to(dest_root)} [{item.reason}]")
+            try:
+                rel_dest = item.dest.relative_to(dest_root)
+            except ValueError:
+                rel_dest = item.dest
+            print(f"- {item.src.name} -> {rel_dest} [{item.reason}]")
         if len(plan) > 25:
             print(f"... plus {len(plan) - 25} more")
 
     execute_plan(plan, dry_run=args.dry_run)
+    cleanup_empty_dirs(dest_root)
 
     if args.dry_run:
         print("\nDRY RUN complete. Nothing moved.")
         print("If it looks right, run again without --dry-run.")
     else:
         print("\nDone. Files moved.")
+
+    if args.sync_onedrive and not args.dry_run:
+        print("\nAttempting OneDrive sync via rclone (non-blocking)...")
+        run_onedrive_sync(dest_root)
+        print("OneDrive sync triggered (if configured).")
 
     return 0
 
