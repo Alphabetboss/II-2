@@ -1,0 +1,64 @@
+{
+  "zones": {
+    "1": {
+      "zone": 1,
+      "minutes": 10,
+      "enabled": true,
+      "start_time": "05:00",
+      "frequency": "daily",
+      "every_x_days": 2,
+      "days_of_week": [],
+      "last_run_date": null
+    },
+    "2": {
+      "zone": 2,
+      "minutes": 10,
+      "enabled": true,
+      "start_time": "05:00",
+      "frequency": "daily",
+      "every_x_days": 2,
+      "days_of_week": [],
+      "last_run_date": null
+    },
+    "3": {
+      "zone": 3,
+      "minutes": 10,
+      "enabled": true,
+      "start_time": "05:00",
+      "frequency": "daily",
+      "every_x_days": 2,
+      "days_of_week": [],
+      "last_run_date": null
+    },
+    "4": {
+      "zone": 4,
+      "minutes": 10,
+      "enabled": true,
+      "start_time": "05:00",
+      "frequency": "daily",
+      "every_x_days": 2,
+      "days_of_week": [],
+      "last_run_date": null
+    },
+    "5": {
+      "zone": 5,
+      "minutes": 10,
+      "enabled": true,
+      "start_time": "05:00",
+      "frequency": "daily",
+      "every_x_days": 2,
+      "days_of_week": [],
+      "last_run_date": null
+    },
+    "6": {
+      "zone": 6,
+      "minutes": 10,
+      "enabled": true,
+      "start_time": "05:00",
+      "frequency": "daily",
+      "every_x_days": 2,
+      "days_of_week": [],
+      "last_run_date": null
+    }
+  }
+}
